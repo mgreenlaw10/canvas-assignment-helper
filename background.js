@@ -68,6 +68,45 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   return true;
 });
 
+function getStoredValue(key) {
+  return new Promise((resolve) => {
+    chrome.storage.local.get([key], (data) => {
+      if (chrome.runtime.lastError) {
+        resolve("");
+        return;
+      }
+
+      resolve(data[key] || "");
+    });
+  });
+}
+
+async function fetchCanvas(url, options = {}) {
+  const token = await getStoredValue("canvasToken");
+  const requestOptions = {
+    ...options,
+    credentials: options.credentials || "include"
+  };
+
+  let response = await fetch(url, requestOptions);
+
+  if (response.ok || !token || !shouldRetryWithToken(response.status)) {
+    return response;
+  }
+
+  return fetch(url, {
+    ...requestOptions,
+    headers: {
+      ...(options.headers || {}),
+      Authorization: `Bearer ${token}`
+    }
+  });
+}
+
+function shouldRetryWithToken(status) {
+  return status === 401 || status === 403;
+}
+
 async function analyzeAssignment(payload) {
   if (!payload?.courseId) {
     throw new Error("Missing course ID.");
@@ -77,7 +116,7 @@ async function analyzeAssignment(payload) {
 
   if (payload.assignmentPdfUrl) {
     try {
-      assignmentDocumentText = await fetchAndExtractText(payload.assignmentPdfUrl);
+      assignmentDocumentText = await fetchAndExtractText(resolveAssignmentPdfUrl(payload));
     } catch (_error) {
       assignmentDocumentText = "";
     }
@@ -96,14 +135,14 @@ async function analyzeAssignment(payload) {
   const relevantFiles = rankRelevantFiles(assignmentText, analyzedFiles);
   const result = {
     relevantFiles,
-    scannedFileCount: analyzedFiles.length
+    scannedFileCount: files.length
   };
 
   chrome.storage.local.set({
     lastAnalysis: {
       assignmentTitle: payload.assignmentTitle || "Assignment",
       matchCount: relevantFiles.length,
-      scannedFileCount: analyzedFiles.length
+      scannedFileCount: files.length
     }
   });
 
@@ -113,6 +152,11 @@ async function analyzeAssignment(payload) {
 async function fetchCourseFiles(courseId) {
   const filesUrl = `https://psu.instructure.com/courses/${courseId}/files`;
   const filesPage = await fetchCoursePage(filesUrl);
+  const apiEntries = await fetchCourseFilesFromApi(courseId);
+
+  if (apiEntries.length) {
+    return apiEntries;
+  }
 
   if (filesPage.ok) {
     const fileEntries = parseCourseFileLinks(filesPage.html, filesUrl, courseId);
@@ -149,11 +193,39 @@ async function fetchModuleFiles(courseId) {
   return fetchModuleFilesFromApi(courseId);
 }
 
+async function fetchCourseFilesFromApi(courseId) {
+  const entries = [];
+  const seen = new Set();
+  let nextUrl =
+    `https://psu.instructure.com/api/v1/courses/${courseId}/files?per_page=100`;
+
+  while (nextUrl) {
+    const response = await fetchCanvas(nextUrl);
+
+    if (!response.ok) {
+      return entries;
+    }
+
+    const files = await response.json();
+    for (const file of files) {
+      const fileEntry = canvasApiFileToEntry(file, courseId);
+      if (!fileEntry || seen.has(fileEntry.url)) {
+        continue;
+      }
+
+      seen.add(fileEntry.url);
+      entries.push(fileEntry);
+    }
+
+    nextUrl = getNextLink(response.headers.get("link"));
+  }
+
+  return entries;
+}
+
 async function fetchCoursePage(url) {
   try {
-    const response = await fetch(url, {
-      credentials: "include"
-    });
+    const response = await fetchCanvas(url);
 
     return {
       ok: response.ok,
@@ -190,9 +262,11 @@ function parseCourseFileLinks(html, baseUrl, courseId) {
     }
 
     seen.add(url);
+    const normalizedUrl = coerceCanvasFileDownloadUrl(url, courseId);
     fileEntries.push({
-      name: (link.text || "").trim() || getFileNameFromUrl(url),
-      url
+      courseId,
+      name: (link.text || "").trim() || getFileNameFromUrl(normalizedUrl),
+      url: normalizedUrl
     });
   }
 
@@ -254,13 +328,10 @@ function pageSuggestsFilesDisabled(html) {
 async function fetchModuleFilesFromApi(courseId) {
   const entries = [];
   const seen = new Set();
-  let nextUrl =
-    `https://psu.instructure.com/api/v1/courses/${courseId}/modules?include[]=items&per_page=100`;
+  let nextUrl = `https://psu.instructure.com/api/v1/courses/${courseId}/modules?per_page=100`;
 
   while (nextUrl) {
-    const response = await fetch(nextUrl, {
-      credentials: "include"
-    });
+    const response = await fetchCanvas(nextUrl);
 
     if (!response.ok) {
       return entries;
@@ -268,15 +339,17 @@ async function fetchModuleFilesFromApi(courseId) {
 
     const modules = await response.json();
     for (const moduleEntry of modules) {
-      const items = Array.isArray(moduleEntry.items) ? moduleEntry.items : [];
+      const items = await fetchModuleItems(courseId, moduleEntry.id);
 
       for (const item of items) {
         const fileEntry = moduleItemToFileEntry(item, courseId);
-        if (!fileEntry || seen.has(fileEntry.url)) {
+        const dedupeKey = fileEntry ? `id:${fileEntry.id}` : "";
+
+        if (!fileEntry || seen.has(dedupeKey)) {
           continue;
         }
 
-        seen.add(fileEntry.url);
+        seen.add(dedupeKey);
         entries.push(fileEntry);
       }
     }
@@ -287,39 +360,77 @@ async function fetchModuleFilesFromApi(courseId) {
   return entries;
 }
 
+async function fetchModuleItems(courseId, moduleId) {
+  if (!moduleId) {
+    return [];
+  }
+
+  const items = [];
+  let nextUrl =
+    `https://psu.instructure.com/api/v1/courses/${courseId}/modules/${moduleId}/items?per_page=100`;
+
+  while (nextUrl) {
+    const response = await fetchCanvas(nextUrl);
+
+    if (!response.ok) {
+      return items;
+    }
+
+    const pageItems = await response.json();
+    if (Array.isArray(pageItems)) {
+      items.push(...pageItems);
+    }
+
+    nextUrl = getNextLink(response.headers.get("link"));
+  }
+
+  return items;
+}
+
 function moduleItemToFileEntry(item, courseId) {
   if (!item || item.type !== "File") {
     return null;
   }
 
-  let url = item.html_url || item.url || "";
-
-  if (!url && item.content_id) {
-    url = `https://psu.instructure.com/courses/${courseId}/files/${item.content_id}`;
-  }
-
-  if (!url) {
-    return null;
-  }
-
-  const absoluteUrl = new URL(url, "https://psu.instructure.com").toString();
-
-  if (!isLikelyReadableFileLink(absoluteUrl, courseId)) {
+  if (!item.content_id) {
     return null;
   }
 
   return {
-    name: (item.title || item.page_url || "").trim() || getFileNameFromUrl(absoluteUrl),
-    url: absoluteUrl
+    courseId,
+    id: item.content_id,
+    name: (item.title || item.page_url || "").trim() || `File ${item.content_id}`
   };
 }
 
 function isLikelyReadableFileLink(url, courseId) {
   return (
     url.includes(`/courses/${courseId}/files/`) ||
+    url.includes(`/api/v1/courses/${courseId}/files/`) ||
     url.includes(`/files/${courseId}`) ||
     url.includes("/download?")
   );
+}
+
+function canvasApiFileToEntry(file, courseId) {
+  if (!file || !file.id) {
+    return null;
+  }
+
+  const url = file.url
+    ? new URL(file.url, "https://psu.instructure.com").toString()
+    : coerceCanvasFileDownloadUrl(
+        file.html_url ||
+          `https://psu.instructure.com/courses/${courseId}/files/${file.id}`,
+        courseId
+      );
+
+  return {
+    courseId,
+    id: file.id,
+    name: (file.display_name || file.filename || "").trim() || getFileNameFromUrl(url),
+    url
+  };
 }
 
 function getNextLink(linkHeader) {
@@ -343,14 +454,16 @@ async function readCourseFiles(files) {
   const results = [];
 
   for (const file of files) {
-    const fileText = await readSingleFile(file);
-    if (!fileText) {
+    const hydratedFile = await ensureFileHasDownloadUrl(file);
+    if (!hydratedFile?.url) {
       continue;
     }
 
+    const fileText = await readSingleFile(hydratedFile);
+
     results.push({
-      ...file,
-      text: fileText
+      ...hydratedFile,
+      text: fileText || ""
     });
   }
 
@@ -369,11 +482,14 @@ async function readSingleFile(file) {
   }
 
   try {
-    const response = await fetch(file.url, {
-      credentials: "include"
-    });
+    const response = await fetchCanvas(file.url);
 
     if (!response.ok) {
+      return "";
+    }
+
+    const contentType = (response.headers.get("content-type") || "").toLowerCase();
+    if (contentType.includes("text/html") && getFileExtension(file.name || "") !== "html") {
       return "";
     }
 
@@ -384,16 +500,77 @@ async function readSingleFile(file) {
 }
 
 async function fetchAndExtractText(url) {
-  const response = await fetch(url, {
-    credentials: "include"
-  });
+  const response = await fetchCanvas(url);
 
   if (!response.ok) {
     throw new Error(`Could not read file (${response.status}).`);
   }
 
+  const contentType = (response.headers.get("content-type") || "").toLowerCase();
+  if (contentType.includes("text/html")) {
+    throw new Error("File request returned HTML instead of a PDF.");
+  }
+
   const buffer = await response.arrayBuffer();
   return extractPdfText(buffer);
+}
+
+async function ensureFileHasDownloadUrl(file) {
+  if (file?.url && isLikelyReadableFileLink(file.url, file.courseId || "")) {
+    return file;
+  }
+
+  if (!file?.id) {
+    return file;
+  }
+
+  const hydrated = await fetchFileEntryById(file.courseId, file.id);
+  if (!hydrated) {
+    return file;
+  }
+
+  return {
+    ...file,
+    ...hydrated
+  };
+}
+
+async function fetchFileEntryById(courseId, fileId) {
+  if (!courseId || !fileId) {
+    return null;
+  }
+
+  const response = await fetchCanvas(
+    `https://psu.instructure.com/api/v1/courses/${courseId}/files/${fileId}`
+  );
+
+  if (!response.ok) {
+    return null;
+  }
+
+  const file = await response.json();
+  return canvasApiFileToEntry(file, courseId);
+}
+
+function resolveAssignmentPdfUrl(payload) {
+  return coerceCanvasFileDownloadUrl(payload.assignmentPdfUrl, payload.courseId);
+}
+
+function coerceCanvasFileDownloadUrl(url, courseId) {
+  const absoluteUrl = new URL(url, "https://psu.instructure.com");
+  const pathname = absoluteUrl.pathname;
+
+  if (pathname.endsWith("/download")) {
+    return absoluteUrl.toString();
+  }
+
+  const courseMatch = pathname.match(new RegExp(`/courses/${courseId}/files/(\\d+)`));
+  if (courseMatch) {
+    absoluteUrl.pathname = `/courses/${courseId}/files/${courseMatch[1]}/download`;
+    return absoluteUrl.toString();
+  }
+
+  return absoluteUrl.toString();
 }
 
 function extractPdfText(buffer) {
@@ -441,7 +618,8 @@ function rankRelevantFiles(assignmentText, files) {
   const relevantFiles = [];
 
   for (const file of files) {
-    const fileKeywords = extractKeywords(file.text);
+    const searchableText = [file.name, file.text].filter(Boolean).join(" ");
+    const fileKeywords = extractKeywords(searchableText);
     const shared = [];
 
     for (const keyword of assignmentKeywords) {
