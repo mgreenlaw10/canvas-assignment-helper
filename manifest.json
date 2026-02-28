@@ -4,7 +4,8 @@
   "version": "0.1.0",
   "description": "Surfaces relevant course files for PSU Canvas assignments.",
   "permissions": [
-    "storage"
+    "storage",
+    "tabs"
   ],
   "host_permissions": [
     "https://psu.instructure.com/*"
